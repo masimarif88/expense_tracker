@@ -213,194 +213,88 @@ and prior-month comparison execute in one SQL statement with `GROUP BY` and
 - `ix_refresh_tokens_user_active` supports revoking all of a user's live
   refresh tokens after token reuse.
 
-## AWS deployment notes
+## AWS Deployment Notes
 
-These are deployment recommendations, not resources created by this repository.
-The current app has no background outbox worker and uses an in-memory receipt
-adapter; those parts need production implementations before deployment.
+These are proposed AWS deployment settings, not resources currently configured in the repository. The outbox worker and persistent receipt storage still need to be implemented before production deployment.
 
-### 1. API and worker
+### 1. API and Worker
 
-- Package the API as an immutable container and run it as an ECS service across
-  at least two Availability Zones, behind an Application Load Balancer (ALB).
-- Start with two API tasks for availability; use CPU, memory, and request
-  latency metrics for target-tracking autoscaling, with sensible minimum and
-  maximum task counts.
-- Run background consumers as a separate ECS service with its own task count
-  and scaling signals (queue depth and oldest-event age); do not run a worker
-  in every API process.
-- ECS restarts unhealthy or exited tasks. ALB health checks should use a
-  readiness endpoint that verifies required dependencies, while liveness
-  checks should avoid restarting tasks for transient downstream issues.
-- Release by registering a new task-definition revision and using an ECS
-  rolling deployment with health checks, connection draining, and a deployment
-  circuit breaker/automatic rollback. Keep old and new tasks serving together
-  during rollout; avoid destructive schema changes until old tasks are gone.
+- Deploy the API on ECS Fargate behind an ALB, across at least two Availability Zones.
+- Start with two API tasks and enable autoscaling based on CPU, memory, and request latency.
+- Run background workers as a separate ECS service, scaling based on queue depth and event age.
+- Configure health checks, graceful shutdown, and automatic recovery for unhealthy tasks.
 
-### 2. Database and secrets
+### 2. Database and Secrets
 
-- Use RDS for PostgreSQL in private database subnets, with public accessibility
-  disabled, encryption enabled, automated backups, and Multi-AZ for production.
-- Allow inbound TCP **5432** on the RDS security group only from the API and
-  worker task security groups; do not allow public or developer IP ranges in
-  the application database rule.
-- Put the database username/password in AWS Secrets Manager (or SSM Parameter
-  Store SecureString) and grant the ECS task role permission to read only that
-  secret; inject it at task start or retrieve it securely at runtime.
-- Never bake plaintext credentials into the image, source tree, task
-  definition, or logs; a task definition should contain only the secret
-  reference. Rotate secrets with a process that permits old and new credentials
-  to overlap during connection-pool replacement.
+- Use private, encrypted RDS PostgreSQL with Multi-AZ and automated backups.
+- Allow port `5432` only from the API and worker security groups.
+- Never keep credentials in source code, Docker images, or logs. Support safe credential rotation.
 
 ### 3. Redis
 
-- Use a private ElastiCache for Redis deployment in the VPC, with in-transit
-  encryption and authentication enabled where supported by the selected
-  deployment mode.
-- Allow TCP **6379** only from API task security groups; do not expose Redis
-  publicly.
-- This code stores login failure counters in Redis. If Redis is unavailable,
-  login currently fails closed with **503** instead of silently bypassing the
-  distributed rate limit.
-- Expense idempotency is stored transactionally in PostgreSQL, not Redis, so
-  retries remain safe during a Redis outage. JWT access tokens are validated
-  locally; refresh-token revocation state is in PostgreSQL.
-- Configure ElastiCache monitoring and alarms, and decide explicitly whether
-  rate-limit counters may reset during Redis failover/eviction; for stricter
-  guarantees use durable Redis settings and an availability plan.
+- Allow port `6379` only from API tasks.
+- Monitor Redis health and configure alarms for failover and memory issues.
 
-### 4. S3 receipts and IAM
+### 4. S3 Receipts and IAM
 
-- Use a private S3 bucket with Block Public Access enabled, TLS-only access,
-  encryption at rest, and lifecycle rules for incomplete multipart uploads.
-- Give each ECS task an IAM task role; do not put AWS access keys in
-  environment variables or application configuration.
-- For a server-generated pre-signed **single PUT** URL restricted to the
-  `receipts/` prefix, the minimal identity policy is:
+- Use a private S3 bucket with Block Public Access, encryption, and lifecycle cleanup.
+- Give ECS tasks IAM roles instead of storing AWS access keys in application configuration.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::YOUR_PRIVATE_BUCKET/receipts/*"
-    }
-  ]
-}
-```
 
-- Replace the bucket placeholder with the deployment bucket. Add narrowly
-  scoped `s3:GetObject` only if the application must read objects itself;
-  downloading can instead use short-lived pre-signed GET URLs.
-- The current receipt endpoint validates file signatures but uses in-memory
-  storage. Production should issue short-lived, key-specific upload URLs,
-  verify the uploaded object and ownership before persisting its key, and
-  never make the bucket public.
+### 5. Alembic Migrations
 
-### 5. Alembic migrations during releases
-
-- Run migrations as a single ECS one-off release task, not from every API
-  replica at startup; make the release pipeline wait for successful completion.
-- Use an expand/contract sequence: first add nullable columns/tables/indexes
-  that old code tolerates, deploy code that can work with both schemas, then
-  backfill and validate data.
-- Only in a later release should code start requiring the expanded schema;
-  remove old columns or constraints after all old tasks and rollback windows
-  have passed.
-- Build large indexes with PostgreSQL's concurrent-index strategy in a
-  separately managed migration when table locks or write pauses would be risky.
-- Make every migration observable and bounded; take backups, alert on failure,
-  and stop the rollout if migration health checks fail. Prefer a forward fix
-  over an unsafe automatic downgrade after application traffic has changed data.
+- Run migrations once through an ECS release task, not from every API instance.
+- Use backward-compatible migrations so old and new application versions can run during deployment.
+- Add new columns or tables first, deploy the updated code, and remove old schema elements in a later release.
+- Take backups, monitor migration failures, and stop deployment if migrations fail. Prefer forward fixes over risky automatic rollbacks.
 
 ## Short interview answers
 
-### 1. Pre-signed upload URLs
+### 1. Pre-signed Upload URLs
 
-1. A pre-signed URL lets the client upload directly to S3, avoiding API memory,
-   bandwidth, connection, and timeout bottlenecks for large files.
-2. The API authenticates first and generates a short-lived URL for one random,
-   user-scoped object key; the bucket stays private.
-3. A leaked URL is a bearer capability until expiry, so keep expiry short,
-   redact it from logs, and never reuse keys.
-4. Bind the signature to the expected method, key, content type, and—where
-   supported—content length or checksum; enforce upload-size limits.
-5. Do not trust the client filename or MIME type: inspect the uploaded bytes
-   and confirm the object belongs to the requesting user before attaching it.
-6. Clean up abandoned uploads with an S3 lifecycle rule; use multipart
-   completion/abort handling for large files.
+1. Pre-signed URLs let clients upload files directly to S3, avoiding unnecessary load on the API.
+2. The API authenticates the user and generates a short-lived URL with a unique, user-specific object key. The bucket remains private.
+3. Since anyone with the URL can use it until expiry, keep its lifetime short and avoid logging it.
+4. Restrict uploads by HTTP method, object key, file type, and size where possible.
+5. Never trust the client filename or MIME type. Validate the uploaded file before attaching it to an expense.
+6. Use S3 lifecycle rules to remove abandoned uploads and handle multipart uploads properly.
 
-### 2. Slow expense listing at 20 million rows
+### 2. Slow Expense Listing at 20 Million Rows
 
-1. Reproduce the slow request and inspect `EXPLAIN (ANALYZE, BUFFERS)` with
-   representative parameters; check row estimates, actual rows, sort spills,
-   heap fetches, and shared reads.
-2. Compare the plan with production query frequency and filters, then add or
-   adjust a composite index matching the ownership predicate and keyset order:
-   `(user_id, spent_on DESC, id DESC)`.
-3. For common category/date filters, validate a targeted index such as
-   `(user_id, category_id, spent_on DESC, id DESC)` against measured plans.
-4. Offset pagination gets slower at deeper pages because the database still
-   scans and discards preceding rows; use the existing signed keyset cursor.
-5. Check substring search separately; use the existing `pg_trgm` GIN index for
-   `ILIKE`, and verify it is selected rather than assuming it helps.
-6. Inspect ORM SQL for N+1 queries; use explicit joins/eager loading or
-   aggregates in SQL, and avoid per-row follow-up queries.
-7. Recheck plans, latency, buffer reads, and write overhead after index
-   changes; indexes improve reads but consume storage and slow writes.
+1. Start with `EXPLAIN (ANALYZE, BUFFERS)` to identify where the query is spending time.
+2. Check the existing indexes and add a composite index where needed, such as `(user_id, spent_on DESC, id DESC)`.
+3. For category-based filtering, consider `(user_id, category_id, spent_on DESC, id DESC)`.
+4. Avoid deep offset pagination. Keyset pagination with the existing signed cursor is a better fit for large datasets.
+5. For text searches, check whether the existing `pg_trgm` GIN index is being used for `ILIKE`.
+6. Review ORM queries for N+1 issues and use joins or eager loading where appropriate.
+7. After changes, compare query execution time and database load. Additional indexes also come with storage and write costs.
 
-### 3. Three API servers behind a load balancer
+### 3. Three API Servers Behind a Load Balancer
 
-1. Access JWTs are signed with the same managed secret on every task; refresh
-   token state is in PostgreSQL, so rotation/reuse detection is not tied to
-   server memory.
-2. Login limits use shared Redis counters, not per-process memory; Redis
-   failure currently returns 503 for login rather than bypassing the limit.
-3. Expense idempotency uses PostgreSQL uniqueness and transactions, so requests
-   routed to different servers still converge on one stored response.
-4. Workers should be a separate, horizontally scaled service using durable
-   database/outbox claims, not an in-process singleton in each API task.
-5. For file uploads, use an IAM task role and short-lived pre-signed S3 URLs;
-   the current development memory adapter is not multi-instance storage.
-6. Run Alembic once in the release pipeline, using backward-compatible
-   expand/contract migrations before rolling API tasks.
-7. Use ALB health checks, graceful draining, shared logs/metrics, and deploy
-   across multiple AZs; never depend on sticky sessions for correctness.
+1. All API servers use the same managed JWT signing secret, while refresh token state is stored in PostgreSQL.
+2. Login rate limits use shared Redis counters instead of local memory. If Redis is unavailable, login requests return 503 rather than bypassing the limits.
+3. Idempotency is handled through PostgreSQL transactions and unique constraints, so requests reaching different servers won't create duplicate expenses.
+4. Run background workers as a separate service rather than starting an independent worker inside every API instance.
+5. Use IAM roles and pre-signed S3 URLs for file uploads. The current in-memory development storage isn't suitable for multiple instances.
+6. Run Alembic migrations through the release pipeline and keep them backward-compatible during deployments.
+7. Use health checks, graceful shutdowns, centralized logging, and multiple availability zones. The application should not depend on sticky sessions.
 
-### 4. Outbox backlog after a two-hour worker outage
+### 4. Outbox Backlog After a Two-Hour Worker Outage
 
-1. The current repository does not yet implement an outbox worker; in
-   production I would persist events in an outbox table in the same transaction
-   as the business change.
-2. On recovery, workers claim bounded batches using row locks with
-   `FOR UPDATE SKIP LOCKED`, then process with a configurable concurrency cap.
-3. Start with a conservative batch/rate limit and increase only while database
-   CPU, connection pool, and query latency stay healthy; leave API capacity
-   reserved.
-4. Make handlers idempotent and mark each event delivered only after success;
-   retry transient failures with backoff and move poison events to a dead-letter
-   state after a limit.
-5. Monitor queue depth and oldest-event age, and autoscale gradually from those
-   signals rather than launching an unbounded worker fleet.
-6. Apply backpressure or pause low-priority event production if lag or database
-   saturation crosses an alert threshold; alert operators until the backlog
-   drains.
+1. The current repository doesn't have an outbox worker yet. For production, I'd store events in an outbox table within the same transaction as the business operation.
+2. Workers can claim batches using `FOR UPDATE SKIP LOCKED` to avoid processing the same events simultaneously.
+3. Start with limited batch sizes and concurrency, then increase gradually while monitoring database load.
+4. Make event handlers idempotent and retry temporary failures with backoff. Move repeatedly failing events to a dead-letter state.
+5. Monitor queue depth and the age of the oldest pending event to track recovery.
+6. If the database becomes overloaded, slow down low-priority processing rather than adding more workers blindly.
 
-### 5. A deliberate simplicity trade-off
+### 5. A Deliberate Simplicity Trade-off
 
-1. Expense idempotency uses PostgreSQL instead of adding a Redis lock.
-2. The unique `(user_id, key)` constraint is the serialization point, so it
-   remains correct across API instances and process restarts.
-3. The expense and replay response are committed with the key record in one
-   transaction, avoiding a distributed consistency problem between Redis and
-   PostgreSQL.
-4. The trade-off is an extra indexed database row and a unique-index write per
-   idempotent request.
-5. For this workload, correctness and operational simplicity are more valuable
-   than avoiding that small database cost; the 24-hour expiry makes keys
-   reusable without a separate cleanup dependency.
+1. I chose PostgreSQL for expense idempotency instead of introducing a separate Redis lock.
+2. A unique `(user_id, key)` constraint prevents duplicate requests, even when multiple API servers handle them.
+3. The expense and its replay response are saved in the same transaction, keeping everything consistent.
+4. This adds a small database write and an indexed record for each idempotent request.
+5. I prefer this approach because it's simpler to maintain and avoids distributed locking. The 24-hour expiry keeps the idempotency window manageable.
 
 ## Notes
 
