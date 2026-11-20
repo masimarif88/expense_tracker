@@ -159,59 +159,6 @@ The login-failure counter is stored in Redis and shared across API instances.
 Five failed attempts are allowed per email in the 15-minute window; blocked
 requests include `Retry-After`.
 
-## Retry and concurrent-update guarantees
-
-`POST /api/v1/expenses` accepts an optional `Idempotency-Key`. The database
-enforces uniqueness on `(user_id, key)`. The request claims the key with a
-PostgreSQL `INSERT ... ON CONFLICT DO UPDATE ... RETURNING` statement, then
-inserts the expense and stores the original response in the same transaction.
-Concurrent requests with a new key serialize on that unique constraint: one
-transaction creates and commits the expense, and the other returns the stored
-response. A repeated key with a different validated request body returns 422.
-Keys become reusable 24 hours after their first accepted request; an expired
-record can be atomically claimed again. This avoids a separate Redis lock and
-keeps the key claim, expense, and replay response transactionally consistent.
-
-Expenses use a version-based ETag such as `"1"`. PATCH sends that value in
-`If-Match`; the API performs the ownership and version predicates together in
-the SQL `UPDATE ... WHERE id = ... AND user_id = ... AND version = ...
-RETURNING` statement, while incrementing the version in the same statement.
-Consequently, two concurrent PATCH requests with the same ETag can have only
-one successful update; the other receives 412 instead of overwriting it.
-
-## Exchange rates and reports
-
-`exchange_rates.rate_to_usd` means currency units per one USD. For instance,
-`278` PKR and `3.6725` AED mean one USD is worth those amounts. Conversion from
-an expense currency to the account currency uses:
-
-`expense_amount / expense_currency_rate_to_usd * base_currency_rate_to_usd`
-
-The seed command inserts PKR, AED, USD, and EUR rates for the latest 90 days.
-The values are fixed demonstration rates, not financial advice or a live feed.
-Seeding does not overwrite existing rates; insert/import real daily data into
-`exchange_rates` when using this beyond a demo. For an expense date, reports
-choose the latest rate on or before that date. If either currency has no
-eligible rate, the report returns `exchange_rate_missing` rather than silently
-understating totals. Monthly report aggregation, conversion, budget percentage,
-and prior-month comparison execute in one SQL statement with `GROUP BY` and
-`LAG`.
-
-## Important indexes
-
-- `ix_expenses_user_spent_on_id` supports a user's descending date/id keyset
-  listing and ownership filter without offset scans.
-- `ix_expenses_user_category_spent_on` supports category-filtered listings and
-  date-range lookups such as monthly aggregation.
-- `ix_expenses_user_currency` supports filtering expenses by currency.
-- `ix_expenses_description_trgm` uses PostgreSQL `pg_trgm` to accelerate
-  substring `ILIKE` searches for `q`.
-- `uq_categories_user_name` enforces per-user category-name uniqueness and
-  supports category lookups by user.
-- The primary key on exchange rates is `(currency, valid_on)`, supporting the
-  latest-rate-before-date lookup.
-- `ix_refresh_tokens_user_active` supports revoking all of a user's live
-  refresh tokens after token reuse.
 
 ## AWS Deployment Notes
 
